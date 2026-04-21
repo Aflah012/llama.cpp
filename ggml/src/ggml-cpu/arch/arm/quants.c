@@ -152,65 +152,43 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q8_0 * GGML_RESTRICT y = vy;
 
 #if defined(__ARM_NEON)
-    float32x4_t sumv = vdupq_n_f32(0.0f);
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t* restrict qbits = x[i].qs; // 16 byte = 128 bit
+        // 1 blok Q1_0 mencakup 4 blok Q8_0
+        for (int j = 0; j < 4; ++j) {
+            const block_q8_0 * b8 = &y[i*4 + j];
+            const float d8 = GGML FP16 TO FP32(b8->d);
+            const int8_t* restrict q8 = b8->qs;
 
-    for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+            // ambil 32 bit weight
+            uint32_t wbits;
+            memcpy(&wbits, qbits + j*4, 4);
 
-        // Process 4 Q8_0 blocks (each has 32 elements)
-        for (int k = 0; k < 4; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            // load 32 activation int8
+            const int8x16_t v0 = vld1q_s8(q8);
+            const int8x16_t v1 = vld1q_s8(q8+ 16);
 
-            // Get the 4 bytes of bits for this Q8_0 block (32 bits = 4 bytes)
-            // Bits are at offset k*4 bytes in x[i].qs
-            const uint8_t * bits = &x[i].qs[k * 4];
+            // expand 32 bit jadi mask 0x00 atau 0xFF per lane
+            // versi sederhana pakai array, nanti bisa dioptimalkan pakai vtbl
+            uint8_t mask_arr[32];
+            for (int k = 0; k < 32; ++k) {
+                mask_arr[k] = (wbits & (lu <<k))? 0xFF: 0x00;
+            }
+            const uint8x16_t mask0 = vid1q_u8(mask_arr);
+            const uint8x16_t mask1 = vld1q_u8(mask_arr + 16);
 
-            // Load 32 int8 values from y
-            const int8x16_t y0 = vld1q_s8(yb->qs);
-            const int8x16_t y1 = vld1q_s8(yb->qs + 16);
+            // hitung sum: jika bit=1 -> +a, jika bit=0 -> -a
+            // (a & mask) - (a & ~mask)
+            const int8x16_t p0 = vandq_s8(v0, vreinterpretq_s8_u8(mask0));
+            const int8x16_t n0 = vandq_s8(v0, vreinterpretq_s8_u8(vmvnq_u8(mas
+            const int8x16_t p1 = vandq_s8(v1, vreinterpretq_s8_u8(mask1));
+            const int8x16_t n1 = vandq_s8(v1, vreinterpretq_s8_u8(vmvnq_u8(mas
+            const int32_t sum = vaddvq_s8(p0) - vaddvq_s8(n0) + vaddvq_s8(p1) -
 
-            // Byte 0-1: bits for y0[0..15]
-            const uint64_t expand0 = table_b2b_0[bits[0]];
-            const uint64_t expand1 = table_b2b_0[bits[1]];
-            // Byte 2-3: bits for y1[0..15]
-            const uint64_t expand2 = table_b2b_0[bits[2]];
-            const uint64_t expand3 = table_b2b_0[bits[3]];
-
-            // Build the sign vectors by reinterpreting the table values
-            uint8x8_t e0 = vcreate_u8(expand0);
-            uint8x8_t e1 = vcreate_u8(expand1);
-            uint8x8_t e2 = vcreate_u8(expand2);
-            uint8x8_t e3 = vcreate_u8(expand3);
-
-            // Shift right by 4 to get 0 or 1
-            int8x8_t s0 = vreinterpret_s8_u8(vshr_n_u8(e0, 4));
-            int8x8_t s1 = vreinterpret_s8_u8(vshr_n_u8(e1, 4));
-            int8x8_t s2 = vreinterpret_s8_u8(vshr_n_u8(e2, 4));
-            int8x8_t s3 = vreinterpret_s8_u8(vshr_n_u8(e3, 4));
-
-            // Convert 0/1 to -1/+1: sign = 2*val - 1
-            int8x8_t one = vdup_n_s8(1);
-            s0 = vsub_s8(vadd_s8(s0, s0), one);  // 2*s0 - 1
-            s1 = vsub_s8(vadd_s8(s1, s1), one);
-            s2 = vsub_s8(vadd_s8(s2, s2), one);
-            s3 = vsub_s8(vadd_s8(s3, s3), one);
-
-            // Combine into 16-element vectors
-            int8x16_t signs0 = vcombine_s8(s0, s1);
-            int8x16_t signs1 = vcombine_s8(s2, s3);
-
-            // Multiply signs with y values and accumulate
-            // dot(signs, y) where signs are +1/-1
-            int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), signs0, y0);
-            int32x4_t p1 = ggml_vdotq_s32(p0, signs1, y1);
-
-            // Scale by d1 and accumulate
-            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p1), d0 * d1);
+            sumf += d * d8 * (float)sum;
         }
     }
-
-    *s = vaddvq_f32(sumv);
 #else
     UNUSED(nb);
     UNUSED(x);
